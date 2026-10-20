@@ -1,0 +1,104 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function loggedIn() { return request.auth != null; }
+    function roomDoc(roomId) { return /databases/$(database)/documents/rooms/$(roomId); }
+    function memberDoc(roomId, userId) { return /databases/$(database)/documents/rooms/$(roomId)/members/$(userId); }
+    function member(roomId) { return loggedIn() && exists(memberDoc(roomId, request.auth.uid)); }
+    function ownMember(roomId, userId) { return loggedIn() && userId == request.auth.uid; }
+
+    match /rooms/{roomId} {
+      // Guessing other groups' codes or listing rooms is not permitted.
+      // Looking up a known code is required for the join transaction.
+      allow get: if loggedIn();
+      allow list: if false;
+      // The founding room and the founder's membership must be one atomic batch.
+      allow create: if loggedIn()
+        && request.resource.data.keys().hasOnly(['name','ownerUid','createdAt','memberCount'])
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.name.size() <= 60
+        && request.resource.data.memberCount == 1
+        && existsAfter(memberDoc(roomId, request.auth.uid));
+      // A join increments the counter AND creates the joining user as a member
+      // in the same transaction. No ninth person can be added.
+      allow update: if loggedIn()
+        && !member(roomId)
+        && resource.data.memberCount is int
+        && resource.data.memberCount >= 1
+        && resource.data.memberCount < 8
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['memberCount'])
+        && request.resource.data.memberCount == resource.data.memberCount + 1
+        && !exists(memberDoc(roomId, request.auth.uid))
+        && existsAfter(memberDoc(roomId, request.auth.uid));
+      allow delete: if false;
+
+      match /members/{userId} {
+        allow get: if member(roomId) || ownMember(roomId,userId);
+        allow list: if member(roomId);
+        allow create: if ownMember(roomId,userId)
+          && request.resource.data.keys().hasOnly(['uid','name','joinedAt'])
+          && request.resource.data.uid == request.auth.uid
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 60
+          && (
+           // Founding batch.
+           (!exists(roomDoc(roomId))
+            && existsAfter(roomDoc(roomId))
+            && getAfter(roomDoc(roomId)).data.ownerUid == request.auth.uid
+            && getAfter(roomDoc(roomId)).data.memberCount == 1)
+           ||
+           // Joining transaction.
+           (exists(roomDoc(roomId))
+            && get(roomDoc(roomId)).data.memberCount < 8
+            && getAfter(roomDoc(roomId)).data.memberCount == get(roomDoc(roomId)).data.memberCount + 1)
+          );
+        allow update: if ownMember(roomId,userId)
+          && request.resource.data.uid == resource.data.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name'])
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0
+          && request.resource.data.name.size() <= 60;
+        // Keep the original 8 membership slots and month-end results stable.
+        allow delete: if false;
+      }
+
+      match /challenges/{challengeId} {
+        allow read: if member(roomId);
+        allow create: if member(roomId)
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.week is string
+          && request.resource.data.title is string
+          && request.resource.data.title.size() > 0
+          && request.resource.data.title.size() <= 64
+          && request.resource.data.target is number
+          && request.resource.data.target > 0
+          && request.resource.data.type in ['min_daily','max_daily','min_weekly'];
+        allow update: if false;
+        allow delete: if member(roomId) && resource.data.createdBy == request.auth.uid;
+      }
+
+      match /logs/{logId} {
+        allow read: if member(roomId);
+        allow create: if member(roomId)
+          && request.resource.data.id == logId
+          && request.resource.data.memberId == request.auth.uid
+          && request.resource.data.value is number
+          && request.resource.data.value >= 0
+          && request.resource.data.value <= 10000000;
+        allow update: if member(roomId)
+          && resource.data.memberId == request.auth.uid
+          && request.resource.data.id == logId
+          && request.resource.data.memberId == request.auth.uid
+          && request.resource.data.challengeId == resource.data.challengeId
+          && request.resource.data.date == resource.data.date
+          && request.resource.data.value is number
+          && request.resource.data.value >= 0
+          && request.resource.data.value <= 10000000;
+        allow delete: if member(roomId) && resource.data.memberId == request.auth.uid;
+      }
+    }
+  }
+}
